@@ -1,3 +1,9 @@
 livekit-agents[assemblyai,cartesia,openai,silero,turn-detector]>=1.0
 livekit-plugins-noise-cancellation>=0.2
 python-dotenv
+
+# Braille translation
+louis>=3.26.0          # liblouis Python bindings (requires: brew install liblouis)
+
+# Database (Phase 2 — safe to install now)
+supabase>=2.3.0
