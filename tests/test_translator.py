@@ -9,15 +9,13 @@ Run with:
     python -m pytest tests/ -v
 """
 
+from normalizer import Normalizer, NormalizerConfig, NormalizationResult
+from braille_translator import BrailleTranslator, BrailleGrade, TranslationResult
 import sys
 import os
-import pytest
 
 # ── Make sure project root is on the path ──────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from braille_translator import BrailleTranslator, BrailleGrade, TranslationResult
-from normalizer import Normalizer, NormalizerConfig, NormalizationResult
 
 
 # ==============================================================================

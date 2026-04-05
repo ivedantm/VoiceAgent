@@ -1,10 +1,11 @@
+import asyncio
 import logging
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -14,17 +15,16 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
-    RunContext,
     cli,
     inference,
     room_io,
 )
-from livekit.agents.llm import function_tool
 from livekit.plugins import (
     noise_cancellation,
     silero,
 )
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from openai import AsyncOpenAI
 
 from braille_translator import BrailleGrade, BrailleTranslator, TranslationResult
 from db.client import BrailleDBClient, DEFAULT_USER_ID
@@ -40,10 +40,12 @@ load_dotenv(".env.local")
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AgentState(str, Enum):
-    IDLE = "idle"               # Waiting for wake-word "hi sparky"
-    LISTENING = "listening"     # Actively capturing speech
-    PROCESSING = "processing"   # Running STT → Normalizer → Translator
-    CONFIRMING = "confirming"   # Low-confidence; asking user to confirm
+    IDLE = "idle"          # Waiting for wake-word "hi sparky"
+    LISTENING = "listening"     # Ready to capture; may have accumulated text
+    ACCUMULATING = "accumulating"  # Got speech; asked "is that all?"; waiting
+    PROCESSING = "processing"    # Running normalizer / translator
+    CONFIRMING = "confirming"    # Agent repeated full text; waiting for yes/no
+    CORRECTING = "correcting"    # Agent asked what's wrong; waiting for fix
 
 
 @dataclass
@@ -65,9 +67,7 @@ class ConversionRecord:
 _normalizer = Normalizer()
 _translator = BrailleTranslator(default_grade=BrailleGrade.GRADE_1)
 _db = BrailleDBClient()
-
-# STT confidence threshold — below this we ask the user to confirm.
-STT_CONFIDENCE_THRESHOLD = 0.70
+_openai = AsyncOpenAI()   # uses OPENAI_API_KEY from .env.local
 
 # Wake-word detection: any of these phrases activate the agent.
 WAKE_PHRASES = frozenset(["hi sparky", "hey sparky", "okay sparky", "sparky"])
@@ -96,14 +96,13 @@ class DefaultAgent(Agent):
 
     Pipeline:
         STT transcript → wake-word gate → normalizer → liblouis translator
-        → voice reply + data channel emission (Phase 3: → Supabase storage)
+        → voice confirmation loop → (on confirm) emit Braille + Supabase storage
     """
 
     def __init__(self) -> None:
         super().__init__(
             instructions="""You are Sparky, a voice-activated Braille transcription system.
-Your ONLY purpose is to convert spoken words into Braille output and display the
-Braille translation on screen.
+Your ONLY purpose is to convert spoken words into Braille output.
 
 ──────────────────────────────────────────────────────
 STARTUP
@@ -118,16 +117,27 @@ Listen ONLY for the wake phrase "hi sparky". Do NOT record or process speech
 until the wake phrase is detected. After activation:
   • Record the user's speech until voice activity ends.
   • If no speech is detected within 10 seconds, say: "Please begin speaking."
-  • Process the speech through the Braille pipeline immediately.
 
 ──────────────────────────────────────────────────────
-SPEECH-TO-BRAILLE PIPELINE
+DONE-SPEAKING GATE  ← RUNS FIRST
 ──────────────────────────────────────────────────────
-1. Transcribe audio using the STT engine.
-2. Normalize the transcript (remove fillers, expand spoken punctuation).
-3. Translate the normalized text to Braille using liblouis (Grade 1 default).
-4. Display the Braille output on screen and emit it to the client.
-5. If STT confidence < 0.70, ask: "Did you mean [transcript]? Please say yes or no."
+After the user pauses, ask: "Is that all, or would you like to continue?"
+• If user says DONE / YES / FINISHED: move to the confirmation loop below.
+• If user says NO / CONTINUE / MORE: say "Go ahead, continue." and wait.
+  Their next speech is appended to what they already said.
+
+──────────────────────────────────────────────────────
+CONFIRMATION LOOP  ← RUNS AFTER USER IS DONE
+──────────────────────────────────────────────────────
+Once the user signals they are done:
+1. Repeat their FULL accumulated text verbatim, then ask:
+   "Is this correct? Please say yes or no."
+2. If the user says YES:
+   • Translate to Braille.
+3. If the user says NO:
+   • Ask: "What part is wrong? Please describe the correction."
+4. Apply the correction, repeat the corrected version, and ask again.
+5. Repeat steps 2–4 until confirmed.
 
 ──────────────────────────────────────────────────────
 VOICE COMMANDS (respond to these after wake word)
@@ -142,7 +152,9 @@ OUTPUT RULES
 ──────────────────────────────────────────────────────
 • Speak in plain text only. No JSON, markdown, lists, or code.
 • Do NOT introduce yourself. Do NOT explain internal processes.
-• After successful translation: say "Translated to Braille." only.
+• After successful translation: You will receive an exact Braille string to output.
+  Copy it CHARACTER FOR CHARACTER. Do not rephrase, summarize, or omit any symbols.
+  Format: "Translated to Braille: <braille characters here>"
 • If translation fails: say "Translation failed. Please try again."
 • Do NOT store, display, or speak anything before the wake phrase.
 """,
@@ -154,8 +166,17 @@ OUTPUT RULES
         self._last_conversion: Optional[ConversionRecord] = None
         self._last_conversion_id: Optional[str] = None   # DB row UUID
         self._history: list[ConversionRecord] = []
+
+        # Speech accumulation (builds up across multiple turns before confirmation)
+        self._accumulated_text: str = ""         # grows as user keeps speaking
+
+        # Feedback-loop state
+        # text waiting for yes/no
         self._pending_confirmation: Optional[str] = None
-        self._session_id: Optional[str] = None           # Supabase session UUID
+        self._pending_stt_confidence: float = 1.0
+
+        # Supabase session UUID
+        self._session_id: Optional[str] = None
         self._session_events: list[dict] = []
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -166,7 +187,6 @@ OUTPUT RULES
             "Sparky agent entered. Translator available: %s",
             _translator.is_available(),
         )
-        # Bootstrap the default user and open a DB session
         try:
             await _db.upsert_user(
                 user_id=DEFAULT_USER_ID,
@@ -206,36 +226,62 @@ OUTPUT RULES
         """
         Called every time the STT engine commits a final transcript.
 
-        This is the entry point for the entire pipeline:
-          STT → wake-word gate → normalizer → translator → emit + store
+        State routing:
+          IDLE        → check wake word
+          LISTENING   → accumulate speech, ask "is that all?"
+          ACCUMULATING → done/continue gate
+          CONFIRMING  → yes/no verification
+          CORRECTING  → apply correction, re-enter CONFIRMING
         """
         transcript: str = getattr(message, "content", str(message)).strip()
         if not transcript:
             return
 
-        logger.info("[STT] Committed transcript: %r", transcript)
+        logger.info("[STT] Committed transcript: %r (state=%s)",
+                    transcript, self._state)
 
         # ── Wake-word gate ──────────────────────────────────────────────────
         if self._state == AgentState.IDLE:
             if _check_wake_word(transcript):
                 self._state = AgentState.LISTENING
                 logger.info("Wake-word detected. Switching to LISTENING.")
-                return  # The agent instructions will handle the verbal response.
             else:
-                # Not active — silently ignore.
-                return
+                logger.debug(
+                    "[IDLE] Ignoring speech (no wake word): %r", transcript)
+            return
+
+        # ── Global stop — works from ANY active state ───────────────────────
+        _lower_global = transcript.lower().strip()
+        if any(cmd in _lower_global for cmd in ["stop", "go to sleep", "sleep"]):
+            prev_state = self._state
+            self._state = AgentState.IDLE
+            self._accumulated_text = ""
+            self._pending_confirmation = None
+            logger.info(
+                "Stop command received from state=%s. Returning to IDLE.", prev_state)
+            await self.session.say(
+                "Okay, going to sleep. Say hi Sparky to wake me up.",
+                allow_interruptions=False,
+            )
+            return
+
+        # ── Done/continue gate ──────────────────────────────────────────────
+        if self._state == AgentState.ACCUMULATING:
+            await self._handle_accumulation_check(transcript)
+            return
 
         # ── Confirmation response ───────────────────────────────────────────
         if self._state == AgentState.CONFIRMING:
             await self._handle_confirmation(transcript)
             return
 
-        # ── Voice command routing ───────────────────────────────────────────
-        lower = transcript.lower()
-        if any(cmd in lower for cmd in ["stop", "go to sleep", "sleep"]):
-            self._state = AgentState.IDLE
-            logger.info("Stop command received. Returning to IDLE.")
+        # ── Correction response ─────────────────────────────────────────────
+        if self._state == AgentState.CORRECTING:
+            await self._handle_correction(transcript)
             return
+
+        # ── Voice commands (LISTENING state only) ───────────────────────────
+        lower = transcript.lower()
 
         if "save" in lower:
             await self._run_save()
@@ -245,7 +291,7 @@ OUTPUT RULES
             await self._run_export(lower)
             return
 
-        if "show" in lower and "conversion" in lower or "history" in lower:
+        if ("show" in lower and "conversion" in lower) or "history" in lower:
             await self._run_history()
             return
 
@@ -259,28 +305,195 @@ OUTPUT RULES
             logger.info("Switched to Grade 1 Braille.")
             return
 
-        # ── Run Braille pipeline ────────────────────────────────────────────
+        # ── Accumulate speech and ask if the user is done ───────────────────
         clean_transcript = _strip_wake_word(transcript)
         if not clean_transcript:
             return
 
-        # Optionally get STT confidence from the message metadata
-        stt_confidence: float = getattr(message, "confidence", 1.0) or 1.0
+        # Append to any previously accumulated text
+        if self._accumulated_text:
+            self._accumulated_text += " " + clean_transcript
+        else:
+            self._accumulated_text = clean_transcript
 
-        # Low-confidence STT → ask for voice confirmation
-        if stt_confidence < STT_CONFIDENCE_THRESHOLD:
-            self._state = AgentState.CONFIRMING
-            self._pending_confirmation = clean_transcript
-            logger.info(
-                "STT confidence %.2f below threshold. Requesting confirmation.",
-                stt_confidence,
-            )
-            return  # Agent instructions will prompt user to confirm
+        self._state = AgentState.ACCUMULATING
+        logger.info("[Accumulate] Buffer now: %r", self._accumulated_text)
 
-        await self._run_pipeline(
-            raw_text=clean_transcript,
-            stt_confidence=stt_confidence,
+        # Brief pause so the question doesn't fire on top of the user's last word
+        await asyncio.sleep(1.2)
+
+        # Guard: if stop was called during the sleep, don't ask "is that all?"
+        if self._state != AgentState.ACCUMULATING:
+            return
+
+        await self.session.generate_reply(
+            instructions=(
+                'Ask: "Is that all, or would you like to continue speaking? '
+                'Say done when finished, or continue to keep going."'
+            ),
+            allow_interruptions=True,
         )
+
+    # ── Accumulation check handler ─────────────────────────────────────────────
+
+    async def _handle_accumulation_check(self, response: str) -> None:
+        """
+        Handle the 'is that all?' gate.
+
+        done/yes  → lock accumulated text as pending_confirmation → CONFIRMING
+        no/more   → say 'go ahead' → LISTENING (buffer kept, user appends)
+        unclear   → re-prompt
+        """
+        lower = response.lower().strip()
+
+        done_words = ["yes", "done", "finished", "that's all", "that is all",
+                      "yeah", "yep", "correct", "i'm done", "im done"]
+        more_words = ["no", "continue", "not yet", "not done", "nope",
+                      "keep going", "more", "i'm not done", "im not done"]
+
+        if any(word in lower for word in done_words):
+            full_text = self._accumulated_text
+            self._accumulated_text = ""
+            self._pending_confirmation = full_text
+            self._pending_stt_confidence = 1.0
+            self._state = AgentState.CONFIRMING
+            logger.info("[Accumulate] User done. Full text: %r", full_text)
+
+            await self.session.generate_reply(
+                instructions=(
+                    f'Repeat these words verbatim: "{full_text}" '
+                    f'— then ask: "Is this correct? Please say yes or no."'
+                ),
+                allow_interruptions=True,
+            )
+
+        elif any(word in lower for word in more_words):
+            self._state = AgentState.LISTENING
+            logger.info("[Accumulate] User wants to continue speaking.")
+
+            await self.session.generate_reply(
+                instructions='Say: "Go ahead, continue speaking."',
+                allow_interruptions=True,
+            )
+
+        else:
+            # Unclear — stay in ACCUMULATING and re-prompt
+            logger.info(
+                "[Accumulate] Unclear response %r — re-prompting.", response)
+            await self.session.generate_reply(
+                instructions=(
+                    'Say: "Say done when you\'re finished, '
+                    'or continue to keep speaking."'
+                ),
+                allow_interruptions=True,
+            )
+
+    # ── Confirmation handler ───────────────────────────────────────────────────
+
+    async def _handle_confirmation(self, response: str) -> None:
+        """
+        Process a yes/no confirmation response.
+
+        yes → run Braille pipeline → LISTENING
+        no  → ask what's wrong  → CORRECTING
+        """
+        lower = response.lower().strip()
+
+        if any(word in lower for word in ["yes", "correct", "right", "confirm", "yep", "yeah"]):
+            logger.info("[Confirm] User confirmed. Running pipeline.")
+            pending = self._pending_confirmation
+            confidence = self._pending_stt_confidence
+            self._pending_confirmation = None
+            self._pending_stt_confidence = 1.0
+            self._state = AgentState.LISTENING
+
+            if pending:
+                await self._run_pipeline(raw_text=pending, stt_confidence=confidence)
+
+        elif any(word in lower for word in ["no", "wrong", "incorrect", "not right", "nope", "nah"]):
+            logger.info("[Confirm] User rejected. Entering CORRECTING.")
+            self._state = AgentState.CORRECTING
+
+            await self.session.generate_reply(
+                instructions='Ask: "What part is wrong? Please describe the correction."',
+                allow_interruptions=True,
+            )
+
+        else:
+            # Unclear response — stay in CONFIRMING and prompt again
+            logger.info(
+                "[Confirm] Unclear response %r — re-prompting.", response)
+            await self.session.generate_reply(
+                instructions='Say: "Sorry, I didn\'t catch that. Please say yes or no."',
+                allow_interruptions=True,
+            )
+
+    # ── Correction handler ─────────────────────────────────────────────────────
+
+    async def _handle_correction(self, correction_description: str) -> None:
+        """
+        Apply the user's described correction to the pending transcript via LLM,
+        then re-enter CONFIRMING with the updated text.
+        """
+        original = self._pending_confirmation or ""
+        logger.info(
+            "[Correct] Applying correction. Original: %r | Description: %r",
+            original, correction_description,
+        )
+
+        corrected = await self._apply_correction_via_llm(original, correction_description)
+        logger.info("[Correct] Corrected text: %r", corrected)
+
+        self._pending_confirmation = corrected
+        self._state = AgentState.CONFIRMING
+
+        await self.session.generate_reply(
+            instructions=(
+                f'Repeat these words verbatim: "{corrected}" '
+                f'— then ask: "Is this correct? Please say yes or no."'
+            ),
+            allow_interruptions=True,
+        )
+
+    async def _apply_correction_via_llm(
+        self,
+        original: str,
+        correction_description: str,
+    ) -> str:
+        """
+        Send the original transcript + correction description to GPT and return
+        only the corrected text string. Falls back to the original on error.
+        """
+        try:
+            response = await _openai.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a text correction assistant. "
+                            "The user will give you an original transcript and a description of what needs to be fixed. "
+                            "Apply the correction and return ONLY the corrected transcript text. "
+                            "No explanation, no punctuation outside the text, no quotes."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Original transcript: {original}\n"
+                            f"Correction needed: {correction_description}\n\n"
+                            "Return ONLY the corrected transcript."
+                        ),
+                    },
+                ],
+            )
+            corrected = response.choices[0].message.content
+            return corrected.strip() if corrected else original
+        except Exception as exc:
+            logger.error(
+                "[Correct] LLM correction failed: %s — keeping original.", exc)
+            return original
 
     # ── Pipeline ───────────────────────────────────────────────────────────────
 
@@ -302,7 +515,9 @@ OUTPUT RULES
         )
 
         if not norm_result.normalized:
-            self._state = AgentState.LISTENING
+            # Only reset if stop wasn't called while we were normalizing
+            if self._state == AgentState.PROCESSING:
+                self._state = AgentState.LISTENING
             return
 
         # 2. Translate
@@ -317,6 +532,12 @@ OUTPUT RULES
             tr_result.confidence,
             tr_result.used_fallback,
         )
+
+        # Bail out early if stop was called while translating
+        if self._state != AgentState.PROCESSING:
+            logger.info(
+                "[Pipeline] Aborted — state changed to %s during translate.", self._state)
+            return
 
         # 3. Store in session history
         record = ConversionRecord(
@@ -337,8 +558,39 @@ OUTPUT RULES
         # 4. Emit braille to room data channel so frontend receives it
         await self._emit_braille(tr_result.braille)
 
-        logger.info("[Pipeline] Complete. Braille emitted.")
-        self._state = AgentState.LISTENING
+        # Bail out if stop was called while emitting
+        if self._state != AgentState.PROCESSING:
+            logger.info(
+                "[Pipeline] Aborted — state changed to %s during emit.", self._state)
+            return
+
+        # 5. Display braille in the playground transcript.
+        #    We use generate_reply (LLM → TTS → transcript) so it appears in the chat.
+        #    The instruction is intentionally blunt to force verbatim output.
+        display_text = f"Translated to Braille: {tr_result.braille}"
+        logger.info("[Pipeline] Complete. %s", display_text)
+        await self.session.generate_reply(
+            instructions=(
+                f"""CRITICAL INSTRUCTION — do not deviate:
+
+Your response must be EXACTLY the following string, copied character by character.
+
+Do NOT rephrase. Do NOT summarize. Do NOT omit any characters, including symbols.
+Do NOT add punctuation, greetings, or extra words. Output ONLY this:
+
+{display_text}"""
+            ),
+            allow_interruptions=False,
+        )
+
+        # Only return to LISTENING if stop wasn't issued while the pipeline ran.
+        # If state is already IDLE (stop was called mid-pipeline), leave it alone.
+        if self._state == AgentState.PROCESSING:
+            self._accumulated_text = ""
+            self._state = AgentState.LISTENING
+        else:
+            logger.info(
+                "[Pipeline] Stop was issued mid-run — staying in state=%s.", self._state)
 
     async def _emit_braille(self, braille: str) -> None:
         """
@@ -355,25 +607,7 @@ OUTPUT RULES
         except Exception as exc:
             logger.warning("Failed to emit braille over data channel: %s", exc)
 
-    # ── Confirmation handler ───────────────────────────────────────────────────
-
-    async def _handle_confirmation(self, response: str) -> None:
-        lower = response.lower().strip()
-        if any(word in lower for word in ["yes", "correct", "right", "confirm"]):
-            if self._pending_confirmation:
-                await self._run_pipeline(
-                    raw_text=self._pending_confirmation,
-                    stt_confidence=1.0,  # User confirmed, treat as high confidence
-                )
-            self._pending_confirmation = None
-            self._state = AgentState.LISTENING
-        elif any(word in lower for word in ["no", "wrong", "incorrect", "cancel"]):
-            self._pending_confirmation = None
-            self._state = AgentState.LISTENING
-            logger.info("User rejected low-confidence transcript.")
-        # Otherwise stay in CONFIRMING and wait for a clearer response.
-
-    # ── Tool helpers (stubs — wired to Supabase in Phase 2/3) ─────────────────
+    # ── Tool helpers ───────────────────────────────────────────────────────────
 
     async def _run_save(self) -> None:
         """Persist the last conversion to Supabase."""
@@ -412,7 +646,6 @@ OUTPUT RULES
         rec = self._last_conversion
         fmt = "txt" if "txt" in transcript else "brl"
 
-        # Write to local exports/ folder
         export_dir = os.path.join(os.path.dirname(__file__), "exports")
         os.makedirs(export_dir, exist_ok=True)
 
@@ -424,7 +657,6 @@ OUTPUT RULES
             f.write(content)
         logger.info("[Export] Written to %s", filepath)
 
-        # Update DB if we have a saved row ID
         if self._last_conversion_id:
             try:
                 await _db.mark_exported(
@@ -472,7 +704,8 @@ server.setup_fnc = prewarm
 @server.rtc_session(agent_name="Sage-210")
 async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
-        stt=inference.STT(model="assemblyai/universal-streaming", language="en"),
+        stt=inference.STT(
+            model="assemblyai/universal-streaming", language="en"),
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
         tts=inference.TTS(
             model="cartesia/sonic-3",
@@ -481,7 +714,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
+        preemptive_generation=False,   # our handler controls every reply explicitly
     )
 
     await session.start(

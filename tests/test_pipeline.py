@@ -15,7 +15,6 @@ Run:
 import asyncio
 import sys
 import os
-import uuid
 
 import pytest
 

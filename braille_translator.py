@@ -60,8 +60,8 @@ class BrailleGrade(str, Enum):
 # liblouis resolves these from its system table directory.
 # UEB = Unified English Braille.
 TABLES: dict[BrailleGrade, list[str]] = {
-    BrailleGrade.GRADE_1: ["en-ueb-g1.ctb"],
-    BrailleGrade.GRADE_2: ["en-ueb-g2.ctb"],
+    BrailleGrade.GRADE_1: ["unicode.dis", "en-ueb-g1.ctb"],
+    BrailleGrade.GRADE_2: ["unicode.dis", "en-ueb-g2.ctb"],
 }
 
 # Fallback: ASCII Braille dot-pattern lookup for when liblouis is missing.
@@ -133,7 +133,8 @@ class BrailleTranslator:
         self._available = _LOUIS_AVAILABLE
 
         if not self._available:
-            logger.warning("Using ASCII-Braille fallback (liblouis not installed).")
+            logger.warning(
+                "Using ASCII-Braille fallback (liblouis not installed).")
 
     # ── public API ─────────────────────────────
 
@@ -217,7 +218,8 @@ class BrailleTranslator:
             )
 
         except Exception as exc:
-            logger.error("liblouis translation failed: %s — falling back.", exc)
+            logger.error(
+                "liblouis translation failed: %s — falling back.", exc)
             return self._translate_fallback(text, grade)
 
     def _translate_fallback(self, text: str, grade: BrailleGrade) -> TranslationResult:

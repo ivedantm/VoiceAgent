@@ -188,7 +188,8 @@ class BrailleDBClient:
             return result.data
 
         rows: list[dict] = await asyncio.to_thread(_select)
-        logger.info("[DB] Fetched %d recent conversions for user %s", len(rows), uid)
+        logger.info(
+            "[DB] Fetched %d recent conversions for user %s", len(rows), uid)
         return rows
 
     async def mark_exported(
@@ -209,7 +210,8 @@ class BrailleDBClient:
             ).eq("id", conversion_id).execute()
 
         await asyncio.to_thread(_update)
-        logger.info("[DB] Marked conversion %s as exported (%s)", conversion_id, export_format)
+        logger.info("[DB] Marked conversion %s as exported (%s)",
+                    conversion_id, export_format)
 
     # ── Sessions ───────────────────────────────────────────────────────────────
 
@@ -256,7 +258,8 @@ class BrailleDBClient:
             update["events"] = events
 
         def _update() -> None:
-            self._client.table("sessions").update(update).eq("id", session_id).execute()
+            self._client.table("sessions").update(
+                update).eq("id", session_id).execute()
 
         await asyncio.to_thread(_update)
         logger.info("[DB] Ended session %s", session_id)
