@@ -1,56 +1,11 @@
-# AI Voice Agent for the Blind
 
-> 🚧 **Work in Progress** — This project is actively being developed.
+  # Voice-Only System Design
 
-## Overview
+  This is a code bundle for Voice-Only System Design. The original project is available at https://www.figma.com/design/04zuQ0wMl9Ivxv2129Jhqz/Voice-Only-System-Design.
 
-An Alexa-style AI voice assistant designed for the blind. Activated by voice, it listens to user input and translates responses to Braille.
+  ## Running the code
 
-Built with [LiveKit](https://livekit.io/) and Python.
+  Run `npm i` to install the dependencies.
 
----
-
-## Setup
-
-```bash
-# Clone the repo
-git clone <your-repo-url>
-cd <your-repo-name>
-
-# Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy env template and fill in your keys
-cp .env.example .env.local
-```
-
-## Environment Variables
-
-See `.env.example` for required variables.
-
----
-
-## Usage
-
-```bash
-python agent.py
-```
-
----
-
-## Status
-
-- [ ] Voice activation
-- [ ] Voice input processing
-- [ ] Braille translation
-- [ ] More coming soon...
-
----
-
-## License
-
-TBD
+  Run `npm run dev` to start the development server.
+  

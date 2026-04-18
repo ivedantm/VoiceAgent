@@ -1,0 +1,160 @@
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --font-size: 16px;
+  --font-display: 'Sora', system-ui, sans-serif;
+  --font-body: 'DM Sans', system-ui, sans-serif;
+
+  /* Voice System State Colors */
+  --state-idle: oklch(0.75 0.08 280);
+  --state-listening: oklch(0.65 0.18 240);
+  --state-processing: oklch(0.75 0.14 85);
+  --state-success: oklch(0.7 0.15 160);
+  --state-error: oklch(0.65 0.18 25);
+
+  /* Warm Dark Theme */
+  --background: oklch(0.18 0.01 60);
+  --foreground: oklch(0.95 0.01 60);
+  --card: oklch(0.22 0.01 60);
+  --card-foreground: oklch(0.95 0.01 60);
+  --popover: oklch(0.22 0.01 60);
+  --popover-foreground: oklch(0.95 0.01 60);
+  --primary: oklch(0.95 0.01 60);
+  --primary-foreground: oklch(0.18 0.01 60);
+  --secondary: oklch(0.28 0.01 60);
+  --secondary-foreground: oklch(0.95 0.01 60);
+  --muted: oklch(0.28 0.01 60);
+  --muted-foreground: oklch(0.65 0.01 60);
+  --accent: oklch(0.32 0.02 60);
+  --accent-foreground: oklch(0.95 0.01 60);
+  --destructive: var(--state-error);
+  --destructive-foreground: oklch(0.95 0.01 60);
+  --border: oklch(0.32 0.01 60);
+  --input: oklch(0.28 0.01 60);
+  --input-background: oklch(0.22 0.01 60);
+  --switch-background: oklch(0.35 0.01 60);
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: oklch(0.5 0.01 60);
+  --radius: 1.5rem;
+}
+
+/* Using default warm dark theme - no separate dark mode needed */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Voice System States */
+  --color-state-idle: var(--state-idle);
+  --color-state-listening: var(--state-listening);
+  --color-state-processing: var(--state-processing);
+  --color-state-success: var(--state-success);
+  --color-state-error: var(--state-error);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  /**
+  * Default typography styles for HTML elements (h1-h4, p, label, button, input).
+  * These are in @layer base, so Tailwind utility classes (like text-sm, text-lg) automatically override them.
+  */
+
+  html {
+    font-size: var(--font-size);
+    font-family: var(--font-body);
+  }
+
+  body {
+    font-family: var(--font-body);
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+  }
+
+  h1 {
+    font-size: var(--text-2xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.3;
+  }
+
+  h2 {
+    font-size: var(--text-xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.3;
+  }
+
+  h3 {
+    font-size: var(--text-lg);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.4;
+  }
+
+  h4 {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.4;
+  }
+
+  label {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  input {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+  }
+}
