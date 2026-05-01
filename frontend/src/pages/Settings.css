@@ -1,0 +1,108 @@
+/* ── Settings ─────────────────────────────────────────────────── */
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-xl);
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.settings-title {
+  font-size: 1.75rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  margin-bottom: 2px;
+}
+
+.settings-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  max-width: 680px;
+}
+
+.settings-card {
+  padding: var(--space-xl);
+}
+
+.settings-card:hover {
+  transform: none;
+}
+
+.settings-card-title {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  margin-bottom: var(--space-sm);
+}
+
+/* Toggle row */
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  cursor: pointer;
+}
+
+.settings-toggle-label {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+/* Custom switch */
+.settings-switch {
+  width: 48px;
+  height: 26px;
+  border-radius: 13px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-default);
+  cursor: pointer;
+  position: relative;
+  transition: all var(--transition-fast);
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.settings-switch--on {
+  background: var(--accent-600);
+  border-color: var(--accent-500);
+}
+
+.settings-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: white;
+  transition: transform var(--transition-fast);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+.settings-switch--on .settings-switch-thumb {
+  transform: translateX(22px);
+}
+
+/* Info grid */
+.settings-info-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.settings-info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.settings-info-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}

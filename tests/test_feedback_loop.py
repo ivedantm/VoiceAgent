@@ -33,6 +33,7 @@ pytestmark = pytest.mark.anyio   # use anyio (already installed) for async tests
 def make_session_mock() -> MagicMock:
     sess = MagicMock()
     sess.generate_reply = AsyncMock()
+    sess.clear_user_turn = MagicMock()
     return sess
 
 
@@ -62,6 +63,7 @@ def make_agent(session_mock=None) -> DefaultAgent:
     agent._last_conversion = None
     agent._last_conversion_id = None
     agent._history = []
+    agent._accumulated_text = ""
     agent._pending_confirmation = None
     agent._pending_stt_confidence = 1.0
     agent._session_id = None
@@ -86,41 +88,40 @@ class TestStateRouting:
     async def test_idle_wake_word_activates(self):
         agent = make_agent()
         agent._state = AgentState.IDLE
-        await agent.on_user_speech_committed(make_message("hi sparky"))
+        await agent.on_user_turn_completed(None, make_message("hi sparky"))
         assert agent._state == AgentState.LISTENING
 
     async def test_idle_no_wake_word_stays_idle(self):
         agent = make_agent()
         agent._state = AgentState.IDLE
-        await agent.on_user_speech_committed(make_message("hello world"))
+        await agent.on_user_turn_completed(None, make_message("hello world"))
         assert agent._state == AgentState.IDLE
 
-    async def test_listening_speech_enters_confirming(self):
+    async def test_listening_speech_enters_accumulating(self):
         agent = make_agent()
         agent._state = AgentState.LISTENING
-        await agent.on_user_speech_committed(make_message("the quick brown fox"))
-        assert agent._state == AgentState.CONFIRMING
-        assert agent._pending_confirmation == "the quick brown fox"
+        await agent.on_user_turn_completed(None, make_message("the quick brown fox"))
+        assert agent._state == AgentState.ACCUMULATING
+        assert agent._accumulated_text == "the quick brown fox"
 
-    async def test_listening_speech_triggers_repeat_prompt(self):
+    async def test_listening_speech_triggers_continue_prompt(self):
         agent = make_agent()
         agent._state = AgentState.LISTENING
-        await agent.on_user_speech_committed(make_message("hello world"))
+        await agent.on_user_turn_completed(None, make_message("hello world"))
         agent.session.generate_reply.assert_awaited_once()
         instructions = agent.session.generate_reply.call_args[1]["instructions"]
-        assert "hello world" in instructions
-        assert "correct" in instructions.lower()
+        assert "Is that all" in instructions
 
     async def test_stop_command_returns_to_idle(self):
         agent = make_agent()
         agent._state = AgentState.LISTENING
-        await agent.on_user_speech_committed(make_message("stop"))
+        await agent.on_user_turn_completed(None, make_message("stop"))
         assert agent._state == AgentState.IDLE
 
     async def test_empty_transcript_ignored(self):
         agent = make_agent()
         agent._state = AgentState.LISTENING
-        await agent.on_user_speech_committed(make_message(""))
+        await agent.on_user_turn_completed(None, make_message(""))
         assert agent._state == AgentState.LISTENING
 
 
@@ -238,38 +239,44 @@ class TestHandleCorrection:
 class TestFullLoop:
 
     async def test_full_loop_yes(self):
-        """Speak → confirm → Braille emitted."""
+        """Speak → done → confirm → Braille emitted."""
         agent = make_agent()
         agent._state = AgentState.LISTENING
         agent._run_pipeline = AsyncMock()
 
-        await agent.on_user_speech_committed(make_message("the quick brown fox"))
+        await agent.on_user_turn_completed(None, make_message("the quick brown fox"))
+        assert agent._state == AgentState.ACCUMULATING
+
+        await agent.on_user_turn_completed(None, make_message("yes")) # equivalent to DONE
         assert agent._state == AgentState.CONFIRMING
 
-        await agent._handle_confirmation("yes")
+        await agent.on_user_turn_completed(None, make_message("yes")) # confirm
         agent._run_pipeline.assert_awaited_once_with(
             raw_text="the quick brown fox", stt_confidence=1.0
         )
         assert agent._state == AgentState.LISTENING
 
     async def test_full_loop_no_then_yes(self):
-        """Speak → reject → correct → confirm → Braille emitted."""
+        """Speak → done → reject → correct → confirm → Braille emitted."""
         agent = make_agent()
         agent._state = AgentState.LISTENING
         agent._run_pipeline = AsyncMock()
 
-        await agent.on_user_speech_committed(make_message("the quick brown fox"))
-        await agent._handle_confirmation("no")
+        await agent.on_user_turn_completed(None, make_message("the quick brown fox"))
+        await agent.on_user_turn_completed(None, make_message("that's all"))
+        assert agent._state == AgentState.CONFIRMING
+
+        await agent.on_user_turn_completed(None, make_message("no"))
         assert agent._state == AgentState.CORRECTING
 
         corrected = "the quick brown dog"
         with patch.object(agent, "_apply_correction_via_llm", AsyncMock(return_value=corrected)):
-            await agent._handle_correction("fox should be dog")
+            await agent.on_user_turn_completed(None, make_message("fox should be dog"))
 
         assert agent._state == AgentState.CONFIRMING
         assert agent._pending_confirmation == corrected
 
-        await agent._handle_confirmation("yes")
+        await agent.on_user_turn_completed(None, make_message("yes"))
         agent._run_pipeline.assert_awaited_once_with(
             raw_text=corrected, stt_confidence=1.0
         )
@@ -281,22 +288,23 @@ class TestFullLoop:
         agent._state = AgentState.LISTENING
         agent._run_pipeline = AsyncMock()
 
-        await agent.on_user_speech_committed(make_message("hello world"))
+        await agent.on_user_turn_completed(None, make_message("hello world"))
+        await agent.on_user_turn_completed(None, make_message("done"))
 
         # Round 1 rejection
-        await agent._handle_confirmation("no")
+        await agent.on_user_turn_completed(None, make_message("no"))
         with patch.object(agent, "_apply_correction_via_llm", AsyncMock(return_value="hello earth")):
-            await agent._handle_correction("world should be earth")
+            await agent.on_user_turn_completed(None, make_message("world should be earth"))
         assert agent._pending_confirmation == "hello earth"
 
         # Round 2 rejection
-        await agent._handle_confirmation("no")
+        await agent.on_user_turn_completed(None, make_message("no"))
         with patch.object(agent, "_apply_correction_via_llm", AsyncMock(return_value="hello moon")):
-            await agent._handle_correction("earth should be moon")
+            await agent.on_user_turn_completed(None, make_message("earth should be moon"))
         assert agent._pending_confirmation == "hello moon"
 
         # Final confirm
-        await agent._handle_confirmation("yes")
+        await agent.on_user_turn_completed(None, make_message("yes"))
         agent._run_pipeline.assert_awaited_once_with(
             raw_text="hello moon", stt_confidence=1.0
         )

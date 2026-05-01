@@ -1,0 +1,23 @@
+/* ── Waveform Viz ─────────────────────────────────────────────── */
+
+.waveform {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  height: 60px;
+  padding: var(--space-sm);
+}
+
+.waveform-bar {
+  width: 3px;
+  min-height: 3px;
+  border-radius: 2px;
+  background: var(--text-muted);
+  transition: height 100ms ease, background 0.3s ease;
+}
+
+.waveform--active .waveform-bar {
+  background: linear-gradient(to top, var(--accent-600), var(--accent-400));
+  box-shadow: 0 0 6px rgba(124, 58, 237, 0.3);
+}

@@ -1,0 +1,21 @@
+/* ── Layout ───────────────────────────────────────────────────── */
+
+.layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.layout-main {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  padding: var(--space-2xl) var(--space-xl);
+  max-width: 1200px;
+  width: 100%;
+}
+
+@media (max-width: 768px) {
+  .layout-main {
+    margin-left: 0;
+    padding: var(--space-lg) var(--space-md);
+  }
+}

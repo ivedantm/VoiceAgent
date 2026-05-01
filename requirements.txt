@@ -7,3 +7,8 @@ louis>=3.26.0          # liblouis Python bindings (requires: brew install liblou
 
 # Database (Phase 2 — safe to install now)
 supabase>=2.3.0
+
+# Backend API (server.py)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+livekit-api>=0.7.0

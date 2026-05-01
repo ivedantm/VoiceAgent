@@ -1,0 +1,53 @@
+/* ── Grade Toggle ─────────────────────────────────────────────── */
+
+.grade-toggle {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-deep);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  border: 1px solid var(--border-subtle);
+}
+
+.grade-toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 10px 18px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  flex: 1;
+  justify-content: center;
+}
+
+.grade-toggle-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.grade-toggle-btn--active {
+  background: linear-gradient(135deg, var(--accent-600), var(--accent-700));
+  color: white;
+  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.25);
+}
+
+.grade-toggle-btn--active:hover {
+  background: linear-gradient(135deg, var(--accent-600), var(--accent-700));
+  color: white;
+}
+
+.grade-toggle-number {
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.grade-toggle-label {
+  font-size: 0.8125rem;
+}

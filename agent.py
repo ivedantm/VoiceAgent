@@ -23,7 +23,6 @@ from livekit.plugins import (
     noise_cancellation,
     silero,
 )
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openai import AsyncOpenAI
 
 from braille_translator import BrailleGrade, BrailleTranslator, TranslationResult
@@ -33,6 +32,13 @@ from normalizer import Normalizer
 logger = logging.getLogger("agent-Sage-210")
 
 load_dotenv(".env.local")
+
+# Debug file logger — captures output from forked child processes
+_debug_fh = logging.FileHandler("/tmp/sparky_debug.log", mode="w")
+_debug_fh.setLevel(logging.DEBUG)
+_debug_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(_debug_fh)
+logger.setLevel(logging.DEBUG)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,9 +87,9 @@ def _check_wake_word(text: str) -> bool:
 
 def _strip_wake_word(text: str) -> str:
     """Remove the wake phrase from the transcript so it is not translated."""
-    for phrase in WAKE_PHRASES:
+    for phrase in sorted(WAKE_PHRASES, key=len, reverse=True):
         text = re.sub(re.escape(phrase), "", text, flags=re.IGNORECASE)
-    return text.strip()
+    return text.strip(" .,?!")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -99,64 +105,16 @@ class DefaultAgent(Agent):
         → voice confirmation loop → (on confirm) emit Braille + Supabase storage
     """
 
-    def __init__(self) -> None:
+    def __init__(self, room=None) -> None:
         super().__init__(
-            instructions="""You are Sparky, a voice-activated Braille transcription system.
-Your ONLY purpose is to convert spoken words into Braille output.
+            instructions="""You are Sparky. You are controlled by a Python application.
+Your ONLY job is to execute the EXACT strings passed to you via 'Say exactly:', 'Ask exactly:', or 'Repeat' system instructions.
 
-──────────────────────────────────────────────────────
-STARTUP
-──────────────────────────────────────────────────────
-When activated, say exactly: "Start speaking to translate."
-Do NOT introduce yourself. Do not hold a conversation.
-
-──────────────────────────────────────────────────────
-WAKE WORD & RECORDING
-──────────────────────────────────────────────────────
-Listen ONLY for the wake phrase "hi sparky". Do NOT record or process speech
-until the wake phrase is detected. After activation:
-  • Record the user's speech until voice activity ends.
-  • If no speech is detected within 10 seconds, say: "Please begin speaking."
-
-──────────────────────────────────────────────────────
-DONE-SPEAKING GATE  ← RUNS FIRST
-──────────────────────────────────────────────────────
-After the user pauses, ask: "Is that all, or would you like to continue?"
-• If user says DONE / YES / FINISHED: move to the confirmation loop below.
-• If user says NO / CONTINUE / MORE: say "Go ahead, continue." and wait.
-  Their next speech is appended to what they already said.
-
-──────────────────────────────────────────────────────
-CONFIRMATION LOOP  ← RUNS AFTER USER IS DONE
-──────────────────────────────────────────────────────
-Once the user signals they are done:
-1. Repeat their FULL accumulated text verbatim, then ask:
-   "Is this correct? Please say yes or no."
-2. If the user says YES:
-   • Translate to Braille.
-3. If the user says NO:
-   • Ask: "What part is wrong? Please describe the correction."
-4. Apply the correction, repeat the corrected version, and ask again.
-5. Repeat steps 2–4 until confirmed.
-
-──────────────────────────────────────────────────────
-VOICE COMMANDS (respond to these after wake word)
-──────────────────────────────────────────────────────
-  • "save"                  → call save_conversion tool
-  • "export" / "export as"  → call export_conversion tool
-  • "show last conversion"  → call get_history tool
-  • "stop" / "go to sleep"  → return to idle mode
-
-──────────────────────────────────────────────────────
-OUTPUT RULES
-──────────────────────────────────────────────────────
-• Speak in plain text only. No JSON, markdown, lists, or code.
-• Do NOT introduce yourself. Do NOT explain internal processes.
-• After successful translation: You will receive an exact Braille string to output.
-  Copy it CHARACTER FOR CHARACTER. Do not rephrase, summarize, or omit any symbols.
-  Format: "Translated to Braille: <braille characters here>"
-• If translation fails: say "Translation failed. Please try again."
-• Do NOT store, display, or speak anything before the wake phrase.
+CRITICAL RULES:
+1. NEVER generate your own responses or try to answer the user's speech directly. 
+2. If the user speaks, you MUST REMAIN COMPLETELY SILENT (return an empty string). The Python script handles all tracking and will explicitly invoke you when a response is needed.
+3. You do NOT perform Braille translation yourself. The Python application handles all translation and will explicitly provide the final string for you to output.
+4. If you have nothing explicit to say via an instruction, DO NOT SPEAK.
 """,
         )
 
@@ -165,6 +123,7 @@ OUTPUT RULES
         self._current_grade: BrailleGrade = BrailleGrade.GRADE_1
         self._last_conversion: Optional[ConversionRecord] = None
         self._last_conversion_id: Optional[str] = None   # DB row UUID
+        self.room = room
         self._history: list[ConversionRecord] = []
 
         # Speech accumulation (builds up across multiple turns before confirmation)
@@ -203,11 +162,6 @@ OUTPUT RULES
         except Exception as exc:
             logger.warning("[DB] Could not open session: %s", exc)
 
-        await self.session.generate_reply(
-            instructions='Say exactly: "Start speaking to translate."',
-            allow_interruptions=False,
-        )
-
     async def on_leave(self) -> None:
         """Called when the agent leaves the room — close the DB session."""
         if self._session_id:
@@ -222,7 +176,7 @@ OUTPUT RULES
 
     # ── Core transcript handler ────────────────────────────────────────────────
 
-    async def on_user_speech_committed(self, message) -> None:
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         """
         Called every time the STT engine commits a final transcript.
 
@@ -233,22 +187,47 @@ OUTPUT RULES
           CONFIRMING  → yes/no verification
           CORRECTING  → apply correction, re-enter CONFIRMING
         """
-        transcript: str = getattr(message, "content", str(message)).strip()
-        if not transcript:
-            return
-
-        logger.info("[STT] Committed transcript: %r (state=%s)",
-                    transcript, self._state)
-
-        # ── Wake-word gate ──────────────────────────────────────────────────
-        if self._state == AgentState.IDLE:
-            if _check_wake_word(transcript):
-                self._state = AgentState.LISTENING
-                logger.info("Wake-word detected. Switching to LISTENING.")
+        try:
+            raw_content = getattr(new_message, "content", "")
+            if isinstance(raw_content, list):
+                parts = []
+                for c in raw_content:
+                    if isinstance(c, str):
+                        parts.append(c)
+                    elif hasattr(c, "text"):
+                        parts.append(str(getattr(c, "text", "")))
+                transcript = " ".join(parts).strip()
             else:
-                logger.debug(
-                    "[IDLE] Ignoring speech (no wake word): %r", transcript)
-            return
+                transcript = str(raw_content).strip()
+            
+            if not transcript:
+                return
+
+            # Suppress LiveKit's automatic LLM generation to prevent TTS crashes
+            self.session.clear_user_turn()
+
+            print(f"[SPARKY] Transcript: {transcript!r} | State: {self._state}", flush=True)
+            logger.info("[STT] Committed transcript: %r (state=%s)",
+                        transcript, self._state)
+
+            # ── Wake-word gate ──────────────────────────────────────────────────
+            if self._state == AgentState.IDLE:
+                if _check_wake_word(transcript):
+                    self._state = AgentState.LISTENING
+                    print("[SPARKY] Wake-word detected! → LISTENING", flush=True)
+                    logger.info("Wake-word detected. Switching to LISTENING.")
+                    await self.session.generate_reply(
+                        instructions='Say exactly: "Start speaking to translate."',
+                        allow_interruptions=False,
+                    )
+                else:
+                    logger.debug(
+                        "[IDLE] Ignoring speech (no wake word): %r", transcript)
+                return
+        except Exception as exc:
+            print(f"[SPARKY ERROR] on_user_turn_completed crashed: {exc}", flush=True)
+            logger.error("[FATAL] on_user_turn_completed error: %s", exc, exc_info=True)
+            raise
 
         # ── Global stop — works from ANY active state ───────────────────────
         _lower_global = transcript.lower().strip()
@@ -259,8 +238,8 @@ OUTPUT RULES
             self._pending_confirmation = None
             logger.info(
                 "Stop command received from state=%s. Returning to IDLE.", prev_state)
-            await self.session.say(
-                "Okay, going to sleep. Say hi Sparky to wake me up.",
+            await self.session.generate_reply(
+                instructions='Say exactly: "Okay, going to sleep. Say hi Sparky to wake me up."',
                 allow_interruptions=False,
             )
             return
@@ -327,10 +306,7 @@ OUTPUT RULES
             return
 
         await self.session.generate_reply(
-            instructions=(
-                'Ask: "Is that all, or would you like to continue speaking? '
-                'Say done when finished, or continue to keep going."'
-            ),
+            instructions='Say exactly: "Is that all, or would you like to continue speaking?"',
             allow_interruptions=True,
         )
 
@@ -347,9 +323,9 @@ OUTPUT RULES
         lower = response.lower().strip()
 
         done_words = ["yes", "done", "finished", "that's all", "that is all",
-                      "yeah", "yep", "correct", "i'm done", "im done"]
+                      "yeah", "yep", "correct", "i'm done", "im done", "that's it", "thats it"]
         more_words = ["no", "continue", "not yet", "not done", "nope",
-                      "keep going", "more", "i'm not done", "im not done"]
+                      "keep going", "more", "i'm not done", "im not done", "continuing"]
 
         if any(word in lower for word in done_words):
             full_text = self._accumulated_text
@@ -361,8 +337,7 @@ OUTPUT RULES
 
             await self.session.generate_reply(
                 instructions=(
-                    f'Repeat these words verbatim: "{full_text}" '
-                    f'— then ask: "Is this correct? Please say yes or no."'
+                    f'Say exactly: "{full_text}. Is this correct? Please say yes or no."'
                 ),
                 allow_interruptions=True,
             )
@@ -382,8 +357,8 @@ OUTPUT RULES
                 "[Accumulate] Unclear response %r — re-prompting.", response)
             await self.session.generate_reply(
                 instructions=(
-                    'Say: "Say done when you\'re finished, '
-                    'or continue to keep speaking."'
+                    'Say exactly: "I didn\'t catch that. Is that all, '
+                    'or would you like to continue speaking?"'
                 ),
                 allow_interruptions=True,
             )
@@ -564,22 +539,12 @@ OUTPUT RULES
                 "[Pipeline] Aborted — state changed to %s during emit.", self._state)
             return
 
-        # 5. Display braille in the playground transcript.
-        #    We use generate_reply (LLM → TTS → transcript) so it appears in the chat.
-        #    The instruction is intentionally blunt to force verbatim output.
+        # 5. Notify user the translation is complete.
+        #    We DO NOT send the braille string to TTS, because it will crash the TTS engine.
         display_text = f"Translated to Braille: {tr_result.braille}"
         logger.info("[Pipeline] Complete. %s", display_text)
         await self.session.generate_reply(
-            instructions=(
-                f"""CRITICAL INSTRUCTION — do not deviate:
-
-Your response must be EXACTLY the following string, copied character by character.
-
-Do NOT rephrase. Do NOT summarize. Do NOT omit any characters, including symbols.
-Do NOT add punctuation, greetings, or extra words. Output ONLY this:
-
-{display_text}"""
-            ),
+            instructions='Say exactly: "Translation complete. Sending to your printer."',
             allow_interruptions=False,
         )
 
@@ -599,11 +564,12 @@ Do NOT add punctuation, greetings, or extra words. Output ONLY this:
         """
         try:
             payload = braille.encode("utf-8")
-            await self.session.room.local_participant.publish_data(
-                payload,
-                topic="braille_output",
-                reliable=True,
-            )
+            if self.room:
+                await self.room.local_participant.publish_data(
+                    payload,
+                    topic="braille_output",
+                    reliable=True,
+                )
         except Exception as exc:
             logger.warning("Failed to emit braille over data channel: %s", exc)
 
@@ -712,13 +678,15 @@ async def entrypoint(ctx: JobContext) -> None:
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
             language="en",
         ),
-        turn_detection=MultilingualModel(),
+        turn_detection=None,           # VAD-only turn detection (matches playground behavior)
         vad=ctx.proc.userdata["vad"],
-        preemptive_generation=False,   # our handler controls every reply explicitly
+        preemptive_generation=False,    # our handler controls every reply explicitly
+        min_endpointing_delay=0.5,      # commit turn 0.5s after user stops speaking
+        max_endpointing_delay=1.5,      # hard commit at 1.5s
     )
 
     await session.start(
-        agent=DefaultAgent(),
+        agent=DefaultAgent(room=ctx.room),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
